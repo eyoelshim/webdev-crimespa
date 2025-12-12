@@ -3,12 +3,11 @@
     "description": "St Paul Crime Single Page Application",
     "version": "1.0.0",
     "author": {
-        "name": "",
-        "email": ""
+        "name": "Eyoel Woldehawariat",
+        "email": "wold1048@stthomas.edu"
     },
-    "contributors": [
-    ],
-    "repository": {},
+    "contributors": ["Abdiwahab Mohammud","Branden Shaffa"],
+    "repository": {"url":"https://github.com/eyoelshim/webdev-crimespa"},
     "type": "module",
     "engines": {
         "node": "^20.19.0 || >=22.12.0"
@@ -19,6 +18,7 @@
         "preview": "vite preview"
     },
     "dependencies": {
+        "leaflet": "^1.9.4",
         "vue": "^3.5.22"
     },
     "devDependencies": {
