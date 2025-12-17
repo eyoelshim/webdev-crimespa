@@ -1,5 +1,5 @@
 <script setup>
-import { reactive, ref, onMounted, computed } from 'vue'
+import { reactive, ref, onMounted, computed, onBeforeUnmount } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 
@@ -22,7 +22,12 @@ const selectedNeighborhoods = ref([])
 const startDate = ref('')
 const endDate = ref('')
 const maxIncidents = ref(1000)
-const locationInput = ref('')
+
+// ✅ Location search input (ONLY what user types)
+const locationQuery = ref('')
+
+// ✅ Separate display for map center (reverse geocode)
+const mapCenterLabel = ref('')
 
 // New incident form
 const showNewIncidentForm = ref(false)
@@ -87,6 +92,15 @@ const map = reactive({
 /* -----------------------------
    MAP INIT
 ------------------------------ */
+let reverseTimer = null
+
+function debounceReverseGeocode() {
+  if (reverseTimer) clearTimeout(reverseTimer)
+  reverseTimer = setTimeout(() => {
+    updateCenterLabelFromMap()
+  }, 350)
+}
+
 onMounted(() => {
   map.leaflet = L.map('leafletmap', { minZoom: 11, maxZoom: 18 })
     .setView([map.center.lat, map.center.lng], map.zoom)
@@ -112,8 +126,15 @@ onMounted(() => {
     })
     .catch((e) => console.error('GeoJSON load error:', e))
 
-  // Update location on map move
-  map.leaflet.on('moveend', updateLocationFromMap)
+  // ✅ Update *label* when map moves (DO NOT touch the search input)
+  map.leaflet.on('moveend', debounceReverseGeocode)
+
+  // initial label
+  debounceReverseGeocode()
+})
+
+onBeforeUnmount(() => {
+  if (reverseTimer) clearTimeout(reverseTimer)
 })
 
 /* -----------------------------
@@ -154,7 +175,7 @@ async function initializeCrimes() {
 async function loadIncidents() {
   const params = new URLSearchParams()
   params.set('limit', maxIncidents.value.toString())
-  
+
   if (selectedCodes.value.length > 0) {
     params.set('code', selectedCodes.value.join(','))
   }
@@ -210,42 +231,62 @@ function updateNeighborhoodCircles() {
 /* -----------------------------
    LOCATION & MAP
 ------------------------------ */
-async function updateLocationFromMap() {
+function clampToStPaul(lat, lng) {
+  // bounds: lat in [se.lat, nw.lat], lng in [nw.lng, se.lng]
+  const clampedLat = Math.max(map.bounds.se.lat, Math.min(map.bounds.nw.lat, lat))
+  const clampedLng = Math.max(map.bounds.nw.lng, Math.min(map.bounds.se.lng, lng))
+  return { lat: clampedLat, lng: clampedLng }
+}
+
+async function updateCenterLabelFromMap() {
   if (!map.leaflet) return
   const center = map.leaflet.getCenter()
 
   try {
     const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?lat=${center.lat}&lon=${center.lng}&format=json`
+      `https://nominatim.openstreetmap.org/reverse?lat=${center.lat}&lon=${center.lng}&format=json`,
+      {
+        headers: {
+          'Accept': 'application/json'
+        }
+      }
     )
     const data = await res.json()
-    locationInput.value = data.display_name || `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`
+    mapCenterLabel.value =
+      data?.display_name || `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`
   } catch {
-    locationInput.value = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`
+    mapCenterLabel.value = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`
   }
 }
 
 async function handleLocationGo() {
+  const q = locationQuery.value.trim()
+  if (!q) return
+
   try {
     const res = await fetch(
-      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(locationInput.value)}&format=json&limit=1`
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1`,
+      { headers: { 'Accept': 'application/json' } }
     )
     const data = await res.json()
 
-    if (data.length > 0) {
+    if (Array.isArray(data) && data.length > 0) {
       let lat = parseFloat(data[0].lat)
       let lng = parseFloat(data[0].lon)
 
-      // Clamp to St. Paul bounds
-      lat = Math.max(map.bounds.se.lat, Math.min(map.bounds.nw.lat, lat))
-      lng = Math.max(map.bounds.nw.lng, Math.min(map.bounds.se.lng, lng))
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        alert('Location found but coordinates were invalid.')
+        return
+      }
 
-      map.leaflet.setView([lat, lng])
+      const clamped = clampToStPaul(lat, lng)
+      map.leaflet.setView([clamped.lat, clamped.lng], 15, { animate: true })
+      // ✅ keep what the user typed; label updates separately
     } else {
       alert('Location not found')
     }
   } catch (err) {
-    alert('Location not found: ' + err.message)
+    alert('Location search failed: ' + (err?.message || err))
   }
 }
 
@@ -254,20 +295,14 @@ async function handleLocationGo() {
 ------------------------------ */
 function toggleCodeFilter(code) {
   const idx = selectedCodes.value.indexOf(code)
-  if (idx > -1) {
-    selectedCodes.value.splice(idx, 1)
-  } else {
-    selectedCodes.value.push(code)
-  }
+  if (idx > -1) selectedCodes.value.splice(idx, 1)
+  else selectedCodes.value.push(code)
 }
 
 function toggleNeighborhoodFilter(id) {
   const idx = selectedNeighborhoods.value.indexOf(id)
-  if (idx > -1) {
-    selectedNeighborhoods.value.splice(idx, 1)
-  } else {
-    selectedNeighborhoods.value.push(id)
-  }
+  if (idx > -1) selectedNeighborhoods.value.splice(idx, 1)
+  else selectedNeighborhoods.value.push(id)
 }
 
 async function applyFilters() {
@@ -284,7 +319,6 @@ async function applyFilters() {
    NEW INCIDENT
 ------------------------------ */
 async function submitNewIncident() {
-  // Validate all fields filled
   const allFilled = Object.values(newIncident.value).every(v => v !== '')
   if (!allFilled) {
     alert('All fields must be filled out')
@@ -297,13 +331,11 @@ async function submitNewIncident() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newIncident.value)
     })
-
     if (!res.ok) throw new Error('Failed to add incident')
 
     alert('Incident added successfully!')
     showNewIncidentForm.value = false
-    
-    // Reset form
+
     newIncident.value = {
       case_number: '',
       date: '',
@@ -314,7 +346,7 @@ async function submitNewIncident() {
       neighborhood_number: '',
       block: ''
     }
-    
+
     await loadIncidents()
   } catch (err) {
     alert('Error adding incident: ' + err.message)
@@ -333,7 +365,6 @@ async function deleteIncident(caseNumber) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ case_number: caseNumber })
     })
-
     if (!res.ok) throw new Error('Failed to delete incident')
 
     alert('Incident deleted successfully')
@@ -347,26 +378,29 @@ async function deleteIncident(caseNumber) {
    SHOW INCIDENT ON MAP
 ------------------------------ */
 async function showIncidentOnMap(incident) {
-  // Remove existing crime marker
   if (map.crimeMarker) {
     map.crimeMarker.remove()
     map.crimeMarker = null
   }
 
-  // Parse address - replace X with 0 in numbers only
-  let address = incident.block.replace(/(\d+)X/g, '$10') + ', St. Paul, MN'
+  const address = incident.block.replace(/(\d+)X/g, '$10') + ', St. Paul, MN'
 
   try {
     const res = await fetch(
-      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`,
+      { headers: { 'Accept': 'application/json' } }
     )
     const data = await res.json()
 
-    if (data.length > 0) {
+    if (Array.isArray(data) && data.length > 0) {
       const lat = parseFloat(data[0].lat)
       const lng = parseFloat(data[0].lon)
 
-      // Create red marker icon
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        alert('Could not locate address on map (invalid coords)')
+        return
+      }
+
       const redIcon = L.icon({
         iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
         shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
@@ -375,20 +409,21 @@ async function showIncidentOnMap(incident) {
         popupAnchor: [1, -34]
       })
 
-      map.crimeMarker = L.marker([lat, lng], { icon: redIcon })
-        .addTo(map.leaflet)
+      map.crimeMarker = L.marker([lat, lng], { icon: redIcon }).addTo(map.leaflet)
 
       const incidentType = codeTypeByCode.value.get(Number(incident.code)) || incident.incident
 
-      map.crimeMarker.bindPopup(
-        `<div style="min-width: 200px">
-           <b>${incidentType}</b><br/>
-           ${incident.date} ${incident.time}<br/>
-           ${incident.block}
-         </div>`
-      ).openPopup()
+      map.crimeMarker
+        .bindPopup(
+          `<div style="min-width: 200px">
+             <b>${incidentType}</b><br/>
+             ${incident.date} ${incident.time}<br/>
+             ${incident.block}
+           </div>`
+        )
+        .openPopup()
 
-      map.leaflet.setView([lat, lng], 16)
+      map.leaflet.setView([lat, lng], 16, { animate: true })
     } else {
       alert('Could not locate address on map')
     }
@@ -460,14 +495,26 @@ function closeDialog() {
     <!-- Location Search -->
     <div class="location-search">
       <label><strong>Location:</strong></label>
+
       <input
         type="text"
-        v-model="locationInput"
+        v-model="locationQuery"
         @keyup.enter="handleLocationGo"
         placeholder="Enter address or coordinates..."
         class="location-input"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+        spellcheck="false"
+        name="crime-location-search"
       />
+
       <button @click="handleLocationGo" class="btn-primary">Go</button>
+    </div>
+
+    <!-- ✅ Separate label so typing never gets overwritten -->
+    <div class="center-label" v-if="mapCenterLabel">
+      <strong>Map center:</strong> <span>{{ mapCenterLabel }}</span>
     </div>
 
     <!-- Filters Section -->
@@ -617,7 +664,7 @@ h1 {
   display: flex;
   gap: 0.75rem;
   align-items: center;
-  margin-bottom: 1.5rem;
+  margin-bottom: 0.5rem;
 }
 
 .location-input {
@@ -626,6 +673,12 @@ h1 {
   border: 1px solid #ccc;
   border-radius: 4px;
   font-size: 1rem;
+}
+
+.center-label {
+  margin-bottom: 1.25rem;
+  font-size: 0.95rem;
+  color: #333;
 }
 
 /* Filters */
